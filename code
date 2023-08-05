@@ -1,0 +1,516 @@
+import chess
+import chess.pgn
+import chess.polyglot
+import chess.syzygy
+import numpy as np
+from datetime import datetime
+from IPython.display import clear_output, display
+import time
+import pygame
+from chess import svg
+from collections import defaultdict
+import random
+from concurrent.futures import ThreadPoolExecutor
+from qiskit import QuantumCircuit, Aer, transpile, assemble
+from qiskit.visualization import plot_histogram
+import chess.pgn
+import datetime
+
+from qiskit_ibm_provider import IBMProvider
+
+
+#IBMProvider.save_account(token='11b27ef5d50f7389c2682c0088b04170da06c29f326eaac3da1ee3c332d368257bd84b853a757287a14e893381766dd0c62a1ff1dbbdfe3373f43135617483be')
+move_counter = [0]
+
+def material_advantage(board):
+    piece_values = {
+        chess.PAWN: 1,
+        chess.KNIGHT: 3,
+        chess.BISHOP: 3,
+        chess.ROOK: 5,
+        chess.QUEEN: 9
+    }
+
+    white_material = 0
+    black_material = 0
+
+    for piece_type, value in piece_values.items():
+        white_material += len(board.pieces(piece_type, chess.WHITE)) * value
+        black_material += len(board.pieces(piece_type, chess.BLACK)) * value
+
+    advantage = white_material - black_material
+
+    return advantage
+def evaluate_position(board):
+    piece_values = {
+        chess.PAWN: 10,
+        chess.KNIGHT: 32,
+        chess.BISHOP: 33,
+        chess.ROOK: 50,
+        chess.QUEEN: 90,
+    }
+    piece_square_tables = {
+        chess.PAWN: [
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [50, 50, 50, 50, 50, 50, 50, 50],
+            [10, 10, 20, 30, 30, 20, 10, 10],
+            [5, 5, 10, 25, 25, 10, 5, 5],
+            [0, 0, 0, 20, 20, 0, 0, 0],
+            [5, -5, -10, 0, 0, -10, -5, 5],
+            [5, 10, 10, -20, -20, 10, 10, 5],
+            [0, 0, 0, 0, 0, 0, 0, 0]
+        ],
+        chess.KNIGHT: [
+            [-50, -40, -30, -30, -30, -30, -40, -50],
+            [-40, -20, 0, 0, 0, 0, -20, -40],
+            [-30, 0, 10, 15, 15, 10, 0, -30],
+            [-30, 5, 15, 20, 20, 15, 5, -30],
+            [-30, 0, 15, 20, 20, 15, 0, -30],
+            [-30, 5, 10, 15, 15, 10, 5, -30],
+            [-40, -20, 0, 5, 5, 0, -20, -40],
+            [-50, -40, -30, -30, -30, -30, -40, -50]
+        ],
+        chess.BISHOP: [
+            [-20, -10, -10, -10, -10, -10, -10, -20],
+            [-10, 0, 0, 0, 0, 0, 0, -10],
+            [-10, 0, 5, 10, 10, 5, 0, -10],
+            [-10, 5, 5, 10, 10, 5, 5, -10],
+            [-10, 0, 10, 10, 10, 10, 0, -10],
+            [-10, 10, 10, 10, 10, 10, 10, -10],
+            [-10, 5, 0, 0, 0, 0, 5, -10],
+            [-20, -10, -10, -10, -10, -10, -10, -20]
+        ],
+        chess.ROOK: [
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [5, 10, 10, 10, 10, 10, 10, 5],
+            [-5, 0, 0, 0, 0, 0, 0, -5],
+            [-5, 0, 0, 0, 0, 0, 0, -5],
+            [-5, 0, 0, 0, 0, 0, 0, -5],
+            [-5, 0, 0, 0, 0, 0, 0, -5],
+            [-5, 0, 0, 0, 0, 0, 0, -5],
+            [0, 0, 0, 5, 5, 0, 0, 0]
+        ],
+        chess.QUEEN: [
+            [-20, -10, -10, -5, -5, -10, -10, -20],
+            [-10, 0, 0, 0, 0, 0, 0, -10],
+            [-10, 0, 5, 5, 5, 5, 0, -10],
+            [-5, 0, 5, 5, 5, 5, 0, -5],
+            [0, 0, 5, 5, 5, 5, 0, -5],
+            [-10, 5, 5, 5, 5, 5, 0, -10],
+            [-10, 0, 5, 0, 0, 0, 0, -10],
+            [-20, -10, -10, -5, -5, -10, -10, -20]
+        ]
+
+    }
+    score = 0
+    for piece_type, value in piece_values.items():
+        for color in [chess.WHITE, chess.BLACK]:
+            square_list = board.pieces(piece_type, color)
+            for square in square_list:
+                if color == chess.WHITE:
+                    score += value
+                    if piece_type in piece_square_tables:
+                        score += piece_square_tables[piece_type][chess.square_rank(square)][chess.square_file(square)]
+                else:
+                    score -= value
+                    if piece_type in piece_square_tables:
+                        score -= piece_square_tables[piece_type][7 - chess.square_rank(square)][chess.square_file(square)]
+    return score
+def mobility(board):
+    white_mobility = len(list(board.legal_moves))
+    board.turn = chess.BLACK
+    black_mobility = len(list(board.legal_moves))
+    board.turn = chess.WHITE
+    return white_mobility - black_mobility
+def center_control(board):
+    center_squares = [chess.D4, chess.D5, chess.E4, chess.E5]
+    center_count = 0
+    for square in center_squares:
+        piece = board.piece_at(square)
+        if piece is not None:
+            if piece.color == chess.WHITE:
+                center_count += 1
+            else:
+                center_count -= 1
+    return center_count
+def evaluate(board):
+    if board.is_checkmate():
+        return float('inf') if board.turn == chess.WHITE else float('-inf')
+    material_weight = 20  # Increase the weight for material advantage
+    mobility_weight = 1
+    center_control_weight = 1
+    positional_weight = 0.05  # Decrease the weight for positional score
+    material_score = 0
+    for piece_type in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
+        material_score += len(board.pieces(piece_type, chess.WHITE)) * (1 if piece_type == chess.PAWN else 3 if piece_type in (chess.KNIGHT, chess.BISHOP) else 5 if piece_type == chess.ROOK else 9)
+        material_score -= len(board.pieces(piece_type, chess.BLACK)) * (1 if piece_type == chess.PAWN else 3 if piece_type in (chess.KNIGHT, chess.BISHOP) else 5 if piece_type == chess.ROOK else 9)
+    material_score = round(material_score, 2)
+    mobility_score = round(mobility(board), 2)
+    center_control_score = round(center_control(board), 2)
+    positional_score = round(evaluate_position(board), 2)
+    total_score = round(material_weight * material_score
+                        + mobility_weight * mobility_score
+                        + center_control_weight * center_control_score
+                        + positional_weight * positional_score, 2)
+    return material_score, mobility_score, center_control_score, positional_score, total_score
+def move_ordering(moves, board):
+    checkmates = []
+    captures = []
+    non_captures = []
+    for move in moves:
+        if board.is_capture(move):
+            captures.append(move)
+        else:
+            non_captures.append(move)
+        # Check for checkmate moves
+        board.push(move)
+        if board.is_checkmate():
+            checkmates.append(move)
+        board.pop()
+    return checkmates + captures + non_captures
+# Set the paths to your opening book and tablebase files
+OPENING_BOOK_PATH = "D:\\Third Year Project Chess Engine\\Openings\\polyglot-collection\\codekiddy.bin"
+TABLEBASE_PATH = "D:\\Third Year Project Chess Engine\\TableBase"
+# Load the opening book and tablebase
+opening_book = chess.polyglot.open_reader(OPENING_BOOK_PATH)
+tablebase = chess.syzygy.open_tablebase(TABLEBASE_PATH)
+def iterative_deepening(board, max_depth, move_counter=None, opening_book=None, tablebase=None):
+    best_move = None
+
+    if move_counter is None:
+        move_counter = [0]
+
+    try:
+        opening_move = opening_book.weighted_choice(board)
+        if opening_move is not None:
+            return opening_move.move, move_counter[0]
+    except IndexError:
+        pass
+
+    num_pieces = len(board.piece_map())
+    if board.castling_rights == 0 and 3 <= num_pieces <= 5:
+        print("Probing tablebase")
+        wdl = tablebase.probe_wdl(board)
+        if board.turn == chess.WHITE:
+            print("WDL:", wdl)
+
+        if wdl is not None:
+            winning_moves = []
+            draw_moves = []
+
+            for move in board.legal_moves:
+                board.push(move)
+                next_wdl = tablebase.probe_wdl(board)
+                next_dtz = tablebase.probe_dtz(board)
+                board.pop()
+                print("Move:", move, "Next WDL:", next_wdl, "Next DTZ:", next_dtz)
+
+                if board.turn == chess.WHITE:
+                    if next_wdl == 2:
+                        winning_moves.append((move, next_dtz))
+                    elif next_wdl == 0:
+                        draw_moves.append((move, next_dtz))
+                else:
+                    if next_wdl == -2:
+                        winning_moves.append((move, next_dtz))
+                    elif next_wdl == 0:
+                        draw_moves.append((move, next_dtz))
+
+            if winning_moves:
+                winning_moves = sorted(winning_moves, key=lambda x: abs(x[1]))
+                print("Winning moves (tablebase):", winning_moves)
+                best_move = winning_moves[0][0]
+                print("Fastest winning move (tablebase):", best_move)
+            elif draw_moves:
+                draw_moves = sorted(draw_moves, key=lambda x: abs(x[1]))
+                best_move = draw_moves[0][0]
+
+            return best_move, move_counter[0]
+
+    if not best_move:
+        for depth in range(1, max_depth + 1):
+            current_best_move, current_best_score = alpha_beta_search(board, depth, float('-inf'), float('inf'), True, move_counter)
+            if current_best_move is not None:
+                best_move = current_best_move
+                best_score = current_best_score
+
+                if abs(best_score) >= 100000:
+                    return best_move, move_counter[0]
+
+    return best_move, move_counter[0] if best_move is not None else None
+
+
+
+def alpha_beta_search(board, depth, alpha, beta, is_maximizing_player, move_counter):
+    move_counter[0] += 1  # Increment move counter
+    if depth == 0 or board.is_game_over():
+        if board.is_checkmate():
+            return None, (100000 if is_maximizing_player else -100000)
+        else:
+            _, _, _, _, score = evaluate(board)
+            return None, score
+    best_move = None
+    legal_moves = move_ordering([move for move in board.legal_moves if board.is_legal(move)], board)
+    if is_maximizing_player:
+        best_score = float('-inf')
+        for move in legal_moves:
+            board.push(move)
+            if board.is_checkmate():
+                board.pop()
+                return move, 100000
+            _, score = alpha_beta_search(board, depth - 1, alpha, beta, not is_maximizing_player, move_counter)
+            board.pop()
+            if score > best_score:
+                best_score = score
+                best_move = move
+                alpha = max(alpha, best_score)
+                if beta <= alpha:
+                    break
+    else:
+        best_score = float('inf')
+        for move in legal_moves:
+            board.push(move)
+            if board.is_checkmate():
+                board.pop()
+                return move, -100000
+            _, score = alpha_beta_search(board, depth - 1, alpha, beta, not is_maximizing_player, move_counter)
+            board.pop()
+            if score < best_score:
+                best_score = score
+                best_move = move
+                beta = min(beta, best_score)
+                if beta <= alpha:
+                    break
+    return best_move, best_score
+
+def is_endgame(board):
+    endgame_piece_count_threshold = [3, 4, 5]
+    piece_count = len(board.piece_map())
+    return piece_count in endgame_piece_count_threshold
+
+
+def search(board, max_depth=5, ai_plays=True, overwhelming_material_advantage=8, opening_book=opening_book,
+           tablebase=tablebase):
+    if ai_plays or board.turn == chess.WHITE:
+        material_diff = material_advantage(board)
+        if board.turn == chess.WHITE and material_diff >= overwhelming_material_advantage:
+            max_depth += 1
+        elif board.turn == chess.BLACK and material_diff <= -overwhelming_material_advantage:
+            max_depth += 1
+        move_counter = [0]  # Initialize move counter
+        best_move, _ = iterative_deepening(board, max_depth, move_counter=move_counter, opening_book=opening_book,
+                                           tablebase=tablebase)
+
+        print(f"Number of board positions considered: {move_counter[0]}")
+        return best_move, None
+    else:
+        legal_moves = list(board.legal_moves)
+        print(f"Legal moves: {legal_moves}")
+        while True:
+            move_string = input("Enter move in UCI notation (e.g. 'e2e4'): ")
+            try:
+                move = chess.Move.from_uci(move_string)
+                if move in legal_moves:
+                    return move, None
+                else:
+                    print("Invalid move, try again.")
+            except ValueError:
+                print("Invalid move, try again.")
+
+
+def play_game(board, depth, play_mode="1"):
+    if play_mode == "1":  # AI vs AI
+        while not board.is_game_over():
+            display_board(board)
+            move, _ = search(board, depth)
+            board.push(move)
+        print("Game Over")
+        display_board(board)
+    elif play_mode == "2":  # Human vs AI
+        while not board.is_game_over():
+            display_board(board)
+            if board.turn == chess.WHITE:
+                move, _ = search(board, depth)
+            else:
+                move = chess.Move.from_uci(input("Enter your move: "))
+            board.push(move)
+        print("Game Over")
+        display_board(board)
+    else:
+        print("Invalid play mode selected.")
+def load_svg(svg_data):
+    svg_file = 'temp.svg'
+    with open(svg_file, 'w') as f:
+        f.write(svg_data)
+    return pygame.image.load(svg_file)
+
+
+def display_board(board, player_color):
+    global screen
+    square_size = 100
+    font = pygame.font.Font(None, 20)
+    for i in range(8):
+        for j in range(8):
+            color = (255, 255, 255) if (i + j) % 2 == 0 else (100, 100, 100)
+            pygame.draw.rect(screen, color, (i * square_size, j * square_size, square_size, square_size))
+
+            # Draw coordinates
+            coord = chess.square_name(j * 8 + (7 - i)) if player_color == chess.BLACK else chess.square_name((7 - j) * 8 + i)
+            coord_color = (255, 255, 255) if color == (100, 100, 100) else (0, 0, 0)
+            coord_text = font.render(coord, True, coord_color)
+            screen.blit(coord_text, (i * square_size + square_size // 2 - 10, j * square_size + square_size // 2 - 10))
+
+            piece = board.piece_at((7 - j) * 8 + i if player_color == chess.WHITE else j * 8 + (7 - i))
+            if piece is not None:
+                draw_piece(screen, piece.symbol(), i * square_size, j * square_size)
+    pygame.display.flip()
+
+
+
+def get_square(mouse_x, mouse_y):
+    if 0 <= mouse_x < 800 and 0 <= mouse_y < 800:
+        file = int(mouse_x // 100)
+        rank = 7 - int(mouse_y // 100)
+        return chess.square(file, rank)
+    return None
+def draw_piece(screen, piece_symbol, x, y):
+    piece_name = piece_symbol.lower()
+    if piece_symbol.isupper():
+        piece_color = 'w'
+    else:
+        piece_color = 'b'
+    path = f"pieces/{piece_color}{piece_name}.png"
+    img = pygame.image.load(path).convert_alpha()
+    img = pygame.transform.scale(img, (100, 100))
+    screen.blit(img, (x, y))
+def get_piece_at_pixel(board, x, y, player_color=chess.BLACK):
+    square_size = 100
+    rank, file = (7 - y // square_size, x // square_size) if player_color == chess.WHITE else (y // square_size, 7 - x // square_size)
+    return board.piece_at(rank * 8 + file)
+
+
+def create_move_from_pixels(board, start_pos, end_pos, player_color=chess.BLACK):
+    square_size = 100
+    start_rank, start_file = (
+    7 - start_pos[1] // square_size, start_pos[0] // square_size) if player_color == chess.WHITE else (
+    start_pos[1] // square_size, 7 - start_pos[0] // square_size)
+    end_rank, end_file = (
+    7 - end_pos[1] // square_size, end_pos[0] // square_size) if player_color == chess.WHITE else (
+    end_pos[1] // square_size, 7 - end_pos[0] // square_size)
+    start_square = chess.square(start_file, start_rank)
+    end_square = chess.square(end_file, end_rank)
+    move = chess.Move(start_square, end_square)
+
+    # Check if the move is a pawn promotion
+    if board.piece_at(start_square) == chess.Piece(chess.PAWN, player_color) and end_rank in [0, 7]:
+        promotion_piece = None
+        while promotion_piece is None:
+            display_board(board, player_color)
+            draw_piece(screen, 'q' if player_color == chess.BLACK else 'Q', end_pos[0], end_pos[1])
+            pygame.display.flip()
+            event = pygame.event.wait()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_q:
+                    promotion_piece = chess.QUEEN
+                elif event.key == pygame.K_r:
+                    promotion_piece = chess.ROOK
+                elif event.key == pygame.K_b:
+                    promotion_piece = chess.BISHOP
+                elif event.key == pygame.K_n:
+                    promotion_piece = chess.KNIGHT
+        move = chess.Move(start_square, end_square, promotion=promotion_piece)
+    return move
+
+
+def human_play(board, search, player_color, opening_book=None, tablebase=None, max_depth=5):
+    global screen
+    global move_counter
+
+    game = chess.pgn.Game()
+    game.headers["Event"] = "AI vs Human"
+    game.headers["Site"] = "Local"
+    game.headers["Date"] = str(datetime.date.today())
+    game.headers["Round"] = 1
+    game.headers["White"] = "AI"
+    game.headers["Black"] = "Human"
+    node = game
+
+    pygame.init()
+    size = (800, 800)
+    screen = pygame.display.set_mode(size)
+    pygame.display.set_caption("Chess AI")
+    running = True
+    dragging = False
+    drag_piece = None
+    drag_start_pos = None
+
+    while not board.is_game_over() and running:
+        display_board(board, player_color)
+
+        if board.turn == player_color:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if event.button == 1:
+                        dragging = True
+                        drag_start_pos = event.pos
+                        drag_piece = get_piece_at_pixel(board, *event.pos, player_color)
+                        if drag_piece is not None and drag_piece.color != player_color:
+                            drag_piece = None
+                elif event.type == pygame.MOUSEMOTION:
+                    if dragging and drag_piece:
+                        x, y = event.pos
+                        draw_piece(screen, drag_piece.symbol(), x - 50, y - 50)
+                        pygame.display.flip()
+                elif event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 1:
+                        dragging = False
+                        if drag_piece:
+                            drag_end_pos = event.pos
+                            move = create_move_from_pixels(board, drag_start_pos, drag_end_pos, player_color)
+                            if move in board.legal_moves:
+                                board.push(move)
+                                node = node.add_variation(move)
+                                display_board(board, player_color)  # Update the display after the move
+                            else:
+                                print("Illegal move. Please try again.")
+
+                        drag_piece = None
+        if board.turn != player_color:
+            # Handle AI move
+            ai_move, _ = search(board, max_depth=max_depth, ai_plays=True, opening_book=opening_book, tablebase=tablebase)
+            if ai_move is None:
+                print("AI couldn't find a move.")
+                break
+            board.push(ai_move)
+            node = node.add_variation(ai_move)
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    pgn_filename = f"ai_vs_human_game_{timestamp}.pgn"
+    with open(pgn_filename, "w") as pgn_file:
+        exporter = chess.pgn.FileExporter(pgn_file)
+        game.accept(exporter)
+
+    while running:
+        display_board(board, player_color)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+    pygame.quit()
+
+
+
+if __name__ == "__main__":
+    board = chess.Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+
+    depth = 5
+    play_mode = input("Select play mode (1 = AI vs AI, 2 = Human vs AI): ")
+
+    if play_mode == "1":
+        print(play_game(board, depth))
+    elif play_mode == "2":
+        player_color = chess.BLACK
+        human_play(board, search, player_color, opening_book, tablebase, max_depth=depth)
+    else:
+        print("Invalid play mode selected.")
